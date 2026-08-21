@@ -403,10 +403,10 @@ bool ADSBeeServer::Update() {
         }
     }
 
-    // Broadcast aircraft locations to connected WiFi clients over GDL90.
+    // Broadcast aircraft locations to connected WiFi and BLE clients over GDL90.
     if (timestamp_ms - last_gdl90_report_timestamp_ms_ > kGDL90ReportingIntervalMs) {
         last_gdl90_report_timestamp_ms_ = timestamp_ms;
-        if (comms_manager.WiFiAccessPointHasClients() && !ReportGDL90()) {
+        if ((comms_manager.WiFiAccessPointHasClients() || ble_gdl90::HasSubscribers()) && !ReportGDL90()) {
             CONSOLE_ERROR("ADSBeeServer::Update", "Encountered error while reporting GDL90.");
             ret = false;
         }
@@ -469,7 +469,9 @@ void ADSBeeServer::SPIReceiveTask() {
 }
 
 bool ADSBeeServer::ReportGDL90() {
-    if (!comms_manager.WiFiAccessPointIsRunning()) {
+    bool wifi_enabled = comms_manager.WiFiAccessPointIsRunning();
+    bool ble_enabled = ble_gdl90::HasSubscribers();
+    if (!wifi_enabled && !ble_enabled) {
         return true;  // Nothing to do.
     }
 
@@ -494,13 +496,38 @@ bool ADSBeeServer::ReportGDL90() {
         aircraft_dictionary.metrics.valid_squitter_frames + aircraft_dictionary.metrics.valid_extended_squitter_frames +
             aircraft_dictionary.metrics.valid_uat_adsb_frames,  // ADS-B message count includes UAT ADS-B messages.
         aircraft_dictionary.metrics.valid_uat_uplink_frames);
-    comms_manager.WiFiAccessPointSendMessageToAllStations(message);
+    if (wifi_enabled) comms_manager.WiFiAccessPointSendMessageToAllStations(message);
+    if (ble_enabled) ble_gdl90::SendGDL90Message(message.data, message.len);
     message.len = 0;
+
+    if (ble_enabled) {
+        // Vendor status message (GDL90 ID 0x65, subtype 0x01): per-band frame counts for this reporting interval,
+        // little-endian u32s. Bands are indistinguishable in standard traffic reports and merged in the heartbeat
+        // count, so BLE clients (e.g. software/ble_panel) accumulate these to show 1090 vs 978 vs FIS-B separately.
+        // Clients that don't understand ID 0x65 discard it harmlessly.
+        uint8_t vendor_message[14];
+        vendor_message[0] = 0x65;
+        vendor_message[1] = 0x01;
+        uint32_t frames_1090 = aircraft_dictionary.metrics.valid_squitter_frames +
+                               aircraft_dictionary.metrics.valid_extended_squitter_frames;
+        uint32_t frames_978_adsb = aircraft_dictionary.metrics.valid_uat_adsb_frames;
+        uint32_t frames_978_uplink = aircraft_dictionary.metrics.valid_uat_uplink_frames;
+        for (int i = 0; i < 4; i++) {
+            vendor_message[2 + i] = (frames_1090 >> (8 * i)) & 0xFF;
+            vendor_message[6 + i] = (frames_978_adsb >> (8 * i)) & 0xFF;
+            vendor_message[10 + i] = (frames_978_uplink >> (8 * i)) & 0xFF;
+        }
+        message.len = gdl90.WriteGDL90Message(message.data, CommsManager::NetworkMessage::kMaxLenBytes, vendor_message,
+                                              sizeof(vendor_message));
+        ble_gdl90::SendGDL90Message(message.data, message.len);
+        message.len = 0;
+    }
 
     // Ownship Report
     message.len = gdl90.WriteGDL90TargetReportMessage(message.data, CommsManager::NetworkMessage::kMaxLenBytes,
                                                       ownship_data, true);
-    comms_manager.WiFiAccessPointSendMessageToAllStations(message);
+    if (wifi_enabled) comms_manager.WiFiAccessPointSendMessageToAllStations(message);
+    if (ble_enabled) ble_gdl90::SendGDL90Message(message.data, message.len);
     message.len = 0;
 
     // Traffic Reports
@@ -553,13 +580,17 @@ bool ADSBeeServer::ReportGDL90() {
             continue;
         }
 
+        // BLE clients get each aircraft as its own notification (one framed message per notification, per the BLE
+        // ADS-B Receiver Service contract); WiFi coalesces multiple aircraft per datagram below.
+        if (ble_enabled) ble_gdl90::SendGDL90Message(aircraft_msg_buf, aircraft_msg_buf_len);
+
         if (message.len + aircraft_msg_buf_len <= CommsManager::NetworkMessage::kMaxLenBytes) {
             // We can tack this aircraft message onto the existing message to save space in the queue.
             memcpy(message.data + message.len, aircraft_msg_buf, aircraft_msg_buf_len);
             message.len += aircraft_msg_buf_len;
         } else {
             // Send the existing message and start a new one.
-            if (!comms_manager.WiFiAccessPointSendMessageToAllStations(message)) {
+            if (wifi_enabled && !comms_manager.WiFiAccessPointSendMessageToAllStations(message)) {
                 CONSOLE_ERROR("ADSBeeServer::ReportGDL90", "Failed to send info about aircraft %d to all clients.",
                               aircraft_index);
             }
@@ -569,7 +600,7 @@ bool ADSBeeServer::ReportGDL90() {
     }
 
     // Send any remaining message data.
-    if (message.len > 0) {
+    if (wifi_enabled && message.len > 0) {
         if (!comms_manager.WiFiAccessPointSendMessageToAllStations(message)) {
             CONSOLE_ERROR("ADSBeeServer::ReportGDL90", "Failed to send final aircraft message to all clients.");
         }
@@ -579,7 +610,9 @@ bool ADSBeeServer::ReportGDL90() {
 }
 
 bool ADSBeeServer::ReportGDL90UplinkDataMessage(const DecodedUATUplinkPacket& uplink_packet) {
-    if (!comms_manager.WiFiAccessPointIsRunning()) {
+    bool wifi_enabled = comms_manager.WiFiAccessPointIsRunning();
+    bool ble_enabled = ble_gdl90::HasSubscribers();
+    if (!wifi_enabled && !ble_enabled) {
         return true;  // Nothing to do.
     }
 
@@ -595,7 +628,11 @@ bool ADSBeeServer::ReportGDL90UplinkDataMessage(const DecodedUATUplinkPacket& up
         return false;
     }
 
-    if (!comms_manager.WiFiAccessPointSendMessageToAllStations(message)) {
+    // FIS-B over BLE (fragmented onto the Uplink characteristic): relevant wherever a 978 MHz uplink network exists
+    // (US FAA, Canadian CIFIB stations).
+    if (ble_enabled) ble_gdl90::SendGDL90Message(message.data, message.len);
+
+    if (wifi_enabled && !comms_manager.WiFiAccessPointSendMessageToAllStations(message)) {
         CONSOLE_ERROR("ADSBeeServer::ReportGDL90UplinkPacket", "Failed to send UAT uplink packet to all clients.");
         return false;
     }
