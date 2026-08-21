@@ -23,7 +23,7 @@ There are two product lines, which share most of their firmware (`firmware/commo
 | Processors | RP2040 + ESP32-S3 + CC1312 | TI CC1314R10 + Semtech LR2021 |
 | 1090 MHz | Custom RF frontend + RP2040 PIO decoder | LR2021 OOK receiver |
 | 978 MHz UAT | CC1312 sub-GHz radio | CC1314 sub-GHz radio (uplink reception selectable) |
-| Interfaces | USB, UART, WiFi, Ethernet (PoE pant / W5500), GNSS | UART (AT commands), SYNC line, LR2021 SPI passthrough |
+| Interfaces | USB, UART, WiFi, Bluetooth LE, Ethernet (PoE pant / W5500), GNSS | UART (AT commands), SYNC line, LR2021 SPI passthrough |
 | Power | ~1W | ~19 mA at 1.8–3.3 V |
 | Firmware | [`firmware/adsbee_1090/`](firmware/adsbee_1090/) | [`firmware/adsbee_1421/`](firmware/adsbee_1421/) |
 
@@ -66,6 +66,7 @@ ADSBee 1090 is an open-source multi-band radio receiver and decoder for ADS-B pa
     * Aircraft JSON
     * CSBee (custom information-rich ASCII protocol)
 * 2.4 GHz 802.11 radio for automatic streaming of decoded values to custom endpoints on the internet. No external compute required, just add WiFi and power!
+* Bluetooth LE ADS-B Receiver Service: GDL90 traffic, ownship, status, and FIS-B uplink over GATT, plus an AT console over Nordic UART. See [GDL90 over Bluetooth LE](#gdl90-over-bluetooth-le).
 * Ethernet interface (requires external PoE pant or W5500 IC).
 * GNSS module connector for MLAT and ground station location information.
 * ~1W power draw.
@@ -82,6 +83,78 @@ The CC1312 can be tuned to a variety of sub-GHz frequencies to decode UAT messag
 The ESP32-S3 ingests raw packets from the RP2040 and maintains a separate, identical aircraft dictionary for use in reporting over network interfaces (WiFi, Ethernet).
 
 All three microcontrollers utilize code stored on the RP2040's external flash chip, so firmware updates are conducted by flashing a single firmware image to the RP2040, which in turn flashes updated firmware images to the CC1312 and ESP32-S3.
+
+### GDL90 over Bluetooth LE
+
+The ESP32-S3 firmware exposes a **BLE ADS-B Receiver Service**, so EFBs can
+connect over Bluetooth LE instead of WiFi. Proven on ADSBee 1090U hardware
+end to end (AvareX on Android, Python on macOS, and Chrome via Web
+Bluetooth as clients).
+
+**Why:** a tablet joined to the receiver's WiFi loses its internet
+connection. Over BLE, traffic streams in while the tablet stays on a phone
+hotspot for weather and NOTAMs — and BLE works on iOS/iPadOS, which
+Bluetooth SPP never did. A traffic-first GDL90 stream is only a few kB/s,
+comfortably inside BLE bandwidth; FIS-B uplink is handled too (see below),
+which matters now that [CIFIB](https://cifib.ca) is building independent
+978 MHz FIS-B ground stations in Canada.
+
+**What's here:**
+
+- **ADS-B Receiver GATT service** (`0BEE0001-1090-46F0-A9AC-52D6BE4C29CC`):
+  typed notify characteristics for Traffic, Ownship, and Status, each
+  notification exactly one framed GDL90 message — atomic, no byte-stream
+  reassembly, payloads any GDL90 decoder already understands. An Uplink
+  characteristic carries FIS-B frames (too big for one notification) with a
+  1-byte first/last/sequence fragmentation header. Up to 3 concurrent
+  clients, preferred MTU 517. Full spec:
+  [BLE_ADSB_SERVICE.md](https://github.com/perryc/avarex/blob/canadian-data/docs/BLE_ADSB_SERVICE.md).
+- **AT command console over BLE**: the standard Nordic UART Service is wired
+  to the same console queue as the WiFi websocket console, so any generic
+  BLE serial terminal app can configure the device wirelessly — including
+  switching WiFi/BLE modes without a USB cable.
+- **[BLE Panel](software/ble_panel/index.html)**: a single-file Web
+  Bluetooth app (Chrome/Edge) with a live decoded traffic table, status,
+  and the AT console — the functional equivalent of the embedded web UI,
+  usable when the receiver's WiFi is off.
+- **Reference client implementation** in the
+  [perryc/avarex fork](https://github.com/perryc/avarex/tree/ble-adsb)
+  (`ble-adsb` branch), including multi-receiver merge (e.g. ADSBee for
+  1090ES plus a [SoftRF](https://github.com/lyusupov/SoftRF/wiki/Card-Edition-MkIII)
+  unit for FANET) and a receiver simulator for development without hardware.
+
+**Constraints and findings:**
+
+- On the 1090U's ESP32-S3 (no PSRAM), **BLE mode and WiFi mode are mutually
+  exclusive** — the BT controller needs ~55 KB of internal RAM that WiFi
+  AP+STA otherwise consume. There is no `AT+BLE` command: BLE starts
+  automatically ~45 s after boot whenever the RAM is available, so the mode
+  switch is done by toggling WiFi (over USB serial, or the BLE console when
+  already in BLE mode):
+
+  ```
+  # Enter BLE mode:
+  AT+WIFI_AP=0
+  AT+WIFI_STA=0
+  AT+SETTINGS=SAVE
+  # then reboot
+
+  # Return to WiFi mode:
+  AT+WIFI_AP=1
+  AT+SETTINGS=SAVE
+  # then reboot (BLE yields; the WiFi stack claims the RAM first)
+  ```
+
+  A PSRAM-equipped module would lift this; a first-class BLE enable setting
+  is future work needing upstream settings-struct coordination.
+- The stock sdkconfig builds the BLE controller **scan-only**:
+  `BT_CTRL_BLE_ADV`, `BT_CTRL_BLE_MASTER` (the connection engine), and
+  `BT_CTRL_BLE_SECURITY_ENABLE` were disabled. Advertising of any kind —
+  including the existing **Broadcast Remote ID transmit feature — could not
+  work on that config**; they are now enabled.
+- NimBLE host bring-up during early boot destabilizes the RP2040↔ESP32 SPI
+  link; it is deferred ~45 s after boot, with a periodic BLE status
+  heartbeat on the console (boot-time logs predate the console bridge).
 
 ## ADSBee 1421
 
@@ -105,7 +178,7 @@ The CC1314R10 runs a NoRTOS super-loop: it polls the LR2021 over SPI for 1090 MH
 | Path | Contents |
 |---|---|
 | [`firmware/`](firmware/) | All firmware. [`adsbee_1090/`](firmware/adsbee_1090/) (RP2040 `pico/`, `esp/`, CC1312 `ti/`), [`adsbee_1421/`](firmware/adsbee_1421/) (CC1314 `ti/`, RP2040-Zero `programmer/`, the ADSBee 1421 Programmer), [`common/`](firmware/common/) (shared decoders, aircraft dictionary, comms, settings), `modules/` (submodules: cppAT, googletest, …), [`scripts/`](firmware/scripts/) (dev tooling), [`build.sh`](firmware/build.sh) dispatcher. |
-| [`software/`](software/) | Host software: [`adsbee_1421_console/`](software/adsbee_1421_console/) (single-file Web Serial console + UART flasher for the 1421), `adsbee/` (Python package), `serial_logger/`, and `tar1090/` / `ultrafeeder/` / `ultra2/` feeder compose files. |
+| [`software/`](software/) | Host software: [`adsbee_1421_console/`](software/adsbee_1421_console/) (single-file Web Serial console + UART flasher for the 1421), [`ble_panel/`](software/ble_panel/index.html) (single-file Web Bluetooth traffic/console panel for the 1090), `adsbee/` (Python package), `serial_logger/`, and `tar1090/` / `ultrafeeder/` / `ultra2/` feeder compose files. |
 | [`ci/`](ci/) | Hardware-in-the-loop USB/UF2 + OTA flash test run by the self-hosted CI runner. |
 | [`kicad/`](kicad/) | Hardware design files (ADSBee 1090, 1090U, frontend prototypes, panels). |
 | [`3d/`](3d/) | Enclosure exports and CAD links. |
