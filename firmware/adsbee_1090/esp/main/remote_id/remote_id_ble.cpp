@@ -22,9 +22,11 @@
 #include <cstring>
 
 #include "ble_adv_watchdog.hh"
+#include "ble_host.hh"
 #include "ble_scan_watchdog.hh"
-#include "comms.hh"  // Logging.
-#include "hal.hh"    // get_time_since_boot_ms.
+#include "comms.hh"      // Logging.
+#include "comms_ble.hh"  // GDL90 GATT service, registered at host bring-up.
+#include "hal.hh"        // get_time_since_boot_ms.
 #include "host/ble_gap.h"
 #include "host/ble_hs.h"
 #include "nimble/nimble_port.h"
@@ -328,6 +330,7 @@ void OnHostSync() {
     s_tx_coded_advertising = false;
     if (s_scan_want) StartExtDiscovery();
     StartRequestedAdvertising();
+    ble_gdl90::OnHostSync();  // The GDL90 GATT service shares the host; let it start its connectable advertising.
 }
 
 void HostTask(void* param) {
@@ -337,11 +340,10 @@ void HostTask(void* param) {
 
 }  // namespace
 
-namespace {
-
-// Brings the NimBLE host + controller up once, shared by the receive (scan) and transmit (advertise) paths. Returns
-// false only if the stack failed to initialize.
-bool EnsureHostInitialized() {
+// Brings the NimBLE host + controller up once, shared by Remote ID (scan/advertise) and the GDL90 GATT service.
+// Returns false only if the stack failed to initialize. GATT services must be registered here, between
+// nimble_port_init() and the host task starting - NimBLE forbids registration afterwards.
+bool BleHostEnsureInitialized() {
     if (s_ble_initialized) return true;
     esp_err_t err = nimble_port_init();
     if (err != ESP_OK) {
@@ -350,12 +352,11 @@ bool EnsureHostInitialized() {
     }
     ble_hs_cfg.sync_cb = OnHostSync;
     ble_hs_cfg.reset_cb = OnHostReset;
+    ble_gdl90::RegisterServices();
     nimble_port_freertos_init(HostTask);
     s_ble_initialized = true;
     return true;
 }
-
-}  // namespace
 
 bool RemoteIDManager::BLEStart(bool enable_coded_phy) {
     s_want_coded = enable_coded_phy;
@@ -371,7 +372,7 @@ bool RemoteIDManager::BLEStart(bool enable_coded_phy) {
         return true;
     }
 
-    if (!EnsureHostInitialized()) return false;
+    if (!BleHostEnsureInitialized()) return false;
     // If the host has already synced (e.g. transmit brought it up first, or scanning was toggled off and on), start
     // discovery now; otherwise OnHostSync() will start it. Sync can run first in the host task, so skip if it did.
     if (s_tx_host_ready && !s_scanning) StartExtDiscovery();
@@ -401,7 +402,7 @@ bool RemoteIDManager::BLETxStart(bool enable_legacy, bool enable_coded_phy) {
     s_tx_legacy_want = enable_legacy;
     s_tx_coded_want = enable_coded_phy;
 
-    if (!EnsureHostInitialized()) return false;
+    if (!BleHostEnsureInitialized()) return false;
     // If the host is already synced, (re)configure the instances now; otherwise OnHostSync() will.
     StartRequestedAdvertising();
 
@@ -514,6 +515,8 @@ void RemoteIDManager::BLEReleaseIfIdle() {
 bool RemoteIDManager::BluetoothIsSupported() { return true; }
 
 #else  // Bluetooth not compiled in: no-op stubs so RemoteIDManager links and reports kStatusNotInBuild.
+
+bool BleHostEnsureInitialized() { return false; }
 
 bool RemoteIDManager::BLEStart(bool) { return false; }
 void RemoteIDManager::BLEStop() {}
