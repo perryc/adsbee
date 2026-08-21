@@ -147,7 +147,8 @@ bool ObjectDictionary::SetBytes(Address addr, uint8_t* buf, uint16_t buf_len, ui
         case kAddrConsole: {
             // Don't print here to avoid print of print doom loop explosion.
             // CONSOLE_INFO("ObjectDictionary::SetBytes", "Forwarding %d byte message to network console.", buf_len);
-            // Runs on the SPI receive task: queue it and let ADSBeeServer::Update() do the (blocking) broadcast.
+            // Runs on the SPI receive task: queue it and let ADSBeeServer::Update() do the (blocking) broadcast to
+            // WebSocket and BLE console clients.
             adsbee_server.QueueNetworkConsoleMessage(buf, buf_len);
             break;
         }

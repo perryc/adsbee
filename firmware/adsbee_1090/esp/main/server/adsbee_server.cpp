@@ -6,6 +6,7 @@
 #include "lwip/sockets.h"
 
 #include "comms.hh"
+#include "comms_ble.hh"
 #include "aircraftjson_utils.hh"
 #include "gdl90/gdl90_utils.hh"
 #include "heap_diagnostics.hh"
@@ -322,6 +323,7 @@ bool ADSBeeServer::Update() {
         size_t len;
         while ((len = xStreamBufferReceive(network_console_tx_buf_, console_chunk, sizeof(console_chunk), 0)) > 0) {
             network_console.BroadcastMessage(console_chunk, len);
+            ble_gdl90::SendConsole(console_chunk, len);  // BLE console clients too.
         }
     }
     network_console.Update();
