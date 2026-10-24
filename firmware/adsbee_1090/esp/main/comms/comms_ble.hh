@@ -40,6 +40,10 @@ bool Start();
 // notification. Cheap no-op with no subscribers.
 bool SendGDL90Message(const uint8_t* buf, uint16_t len_bytes);
 
+// True once the service has brought the shared host up for itself. The host must then stay up even when Remote ID
+// no longer needs it.
+bool IsStarted();
+
 // True if any connected client is subscribed to at least one characteristic (callers can skip building messages).
 bool HasSubscribers();
 

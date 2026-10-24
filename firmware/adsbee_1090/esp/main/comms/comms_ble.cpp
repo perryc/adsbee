@@ -488,6 +488,8 @@ bool Start() {
     return true;
 }
 
+bool IsStarted() { return s_started; }
+
 bool HasSubscribers() {
     for (auto& conn : s_connections) {
         if (conn.InUse() &&
@@ -586,6 +588,7 @@ namespace ble_gdl90 {
 bool RegisterServices() { return false; }
 void OnHostSync() {}
 bool Start() { return false; }
+bool IsStarted() { return false; }
 bool SendGDL90Message(const uint8_t*, uint16_t) { return false; }
 bool HasSubscribers() { return false; }
 bool SendConsole(const char*, uint16_t) { return false; }

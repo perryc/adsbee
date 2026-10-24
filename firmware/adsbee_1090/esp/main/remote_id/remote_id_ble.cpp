@@ -493,6 +493,7 @@ void RemoteIDManager::BLEServiceAdvWatchdog() {
 
 void RemoteIDManager::BLEReleaseIfIdle() {
     if (!s_ble_initialized || ble_running_ || ble_tx_legacy_running_ || ble_tx_coded_running_) return;
+    if (ble_gdl90::IsStarted()) return;  // The GDL90 GATT service shares the host and keeps it.
     // Stops the host task and frees the host and controller, which hold most of the Remote ID RAM.
     int rc = nimble_port_stop();
     if (rc != 0) {
