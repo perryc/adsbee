@@ -490,12 +490,17 @@ bool ADSBeeServer::ReportGDL90() {
     gdl90.utc_timing_is_valid = rp2040_status.gnss_utc_time_valid;
     gdl90.maintenance_required = false;
 
-    // Heartbeat Message
-    message.len = gdl90.WriteGDL90HeartbeatMessage(
-        message.data, CommsManager::NetworkMessage::kMaxLenBytes, get_time_since_boot_ms() / 1000,
-        aircraft_dictionary.metrics.valid_squitter_frames + aircraft_dictionary.metrics.valid_extended_squitter_frames +
-            aircraft_dictionary.metrics.valid_uat_adsb_frames,  // ADS-B message count includes UAT ADS-B messages.
-        aircraft_dictionary.metrics.valid_uat_uplink_frames);
+    // Frame counts come from the RP2040's once-a-second metrics: it sees every frame, while the ESP32's own dictionary
+    // only counts what is forwarded to it and never counts UAT. A snapshot that has stopped arriving counts as nothing.
+    AircraftDictionary::Metrics frame_counts;
+    if (get_time_since_boot_ms() - last_rp2040_metrics_timestamp_ms_ <= kRP2040MetricsStaleTimeoutMs) {
+        frame_counts = rp2040_aircraft_dictionary_metrics;
+    }
+
+    // Heartbeat Message. Its message counts are UAT receptions only (GDL90 ICD 3.1.2): basic and long, and uplink.
+    message.len = gdl90.WriteGDL90HeartbeatMessage(message.data, CommsManager::NetworkMessage::kMaxLenBytes,
+                                                   get_time_since_boot_ms() / 1000, frame_counts.valid_uat_adsb_frames,
+                                                   frame_counts.valid_uat_uplink_frames);
     if (wifi_enabled) comms_manager.WiFiAccessPointSendMessageToAllStations(message);
     if (ble_enabled) ble_gdl90::SendGDL90Message(message.data, message.len);
     message.len = 0;
@@ -508,10 +513,9 @@ bool ADSBeeServer::ReportGDL90() {
         uint8_t vendor_message[14];
         vendor_message[0] = 0x65;
         vendor_message[1] = 0x01;
-        uint32_t frames_1090 = aircraft_dictionary.metrics.valid_squitter_frames +
-                               aircraft_dictionary.metrics.valid_extended_squitter_frames;
-        uint32_t frames_978_adsb = aircraft_dictionary.metrics.valid_uat_adsb_frames;
-        uint32_t frames_978_uplink = aircraft_dictionary.metrics.valid_uat_uplink_frames;
+        uint32_t frames_1090 = frame_counts.valid_squitter_frames + frame_counts.valid_extended_squitter_frames;
+        uint32_t frames_978_adsb = frame_counts.valid_uat_adsb_frames;
+        uint32_t frames_978_uplink = frame_counts.valid_uat_uplink_frames;
         for (int i = 0; i < 4; i++) {
             vendor_message[2 + i] = (frames_1090 >> (8 * i)) & 0xFF;
             vendor_message[6 + i] = (frames_978_adsb >> (8 * i)) & 0xFF;
